@@ -5,7 +5,7 @@ from CONSTANTS import *
 from sklearn.decomposition import FastICA
 from representations.templates.statistics import Simple_template_TF_IDF, Template_TF_IDF_without_clean
 from representations.sequences.statistics import Sequential_TF
-from preprocessing.datacutter.SimpleCutting import cut_by_613, cut_all, cut_by_316, cut_by_172
+from preprocessing.datacutter.SimpleCutting import cut_all, cut_by_172_filter, cut_by_253_filter
 from preprocessing.AutoLabeling import Probabilistic_Labeling
 from preprocessing.Preprocess import Preprocessor
 from module.Optimizer import Optimizer
@@ -16,7 +16,42 @@ from utils.Vocab import Vocab
 lstm_hiddens = 100
 num_layer = 2
 batch_size = 100
-epochs = 5
+epochs = 10
+
+
+def get_updated_network(old, new, lr, load=False):
+    updated_theta = {}
+    state_dicts = old.state_dict()
+    param_dicts = dict(old.named_parameters())
+
+    for i, (k, v) in enumerate(state_dicts.items()):
+        if k in param_dicts.keys() and param_dicts[k].grad is not None:
+            updated_theta[k] = param_dicts[k] - lr * param_dicts[k].grad
+        else:
+            updated_theta[k] = state_dicts[k]
+    if load:
+        new.load_state_dict(updated_theta)
+    else:
+        new = put_theta(new, updated_theta)
+    return new
+
+
+def put_theta(model, theta):
+    def k_param_fn(tmp_model, name=None):
+        if len(tmp_model._modules) != 0:
+            for (k, v) in tmp_model._modules.items():
+                if name is None:
+                    k_param_fn(v, name=str(k))
+                else:
+                    k_param_fn(v, name=str(name + '.' + k))
+        else:
+            for (k, v) in tmp_model._parameters.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                tmp_model._parameters[k] = theta[str(name + '.' + k)]
+
+    k_param_fn(model)
+    return model
 
 
 class MetaLog:
@@ -48,12 +83,20 @@ class MetaLog:
         self.batch_size = 128
         self.test_batch_size = 1024
         self.model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
+        self.bk_model = AttGRUModel(vocab, self.num_layer, self.hidden_size)
         if torch.cuda.is_available():
             self.model = self.model.cuda(device)
+            self.bk_model = self.bk_model.cuda(device)
         self.loss = nn.BCELoss()
 
     def forward(self, inputs, targets):
         tag_logits = self.model(inputs)
+        tag_logits = F.softmax(tag_logits, dim=1)
+        loss = self.loss(tag_logits, targets)
+        return loss
+
+    def bk_forward(self, inputs, targets):
+        tag_logits = self.bk_model(inputs)
         tag_logits = F.softmax(tag_logits, dim=1)
         loss = self.loss(tag_logits, targets)
         return loss
@@ -84,11 +127,11 @@ class MetaLog:
             TP, TN, FP, FN = 0, 0, 0, 0
             tag_correct, tag_total = 0, 0
             for onebatch in data_iter(instances, self.test_batch_size, False):
-                tinst = generate_tinsts_binary_label(onebatch, vocab_HDFS, False)
+                tinst = generate_tinsts_binary_label(onebatch, vocab_BGL, False)
                 tinst.to_cuda(device)
                 self.model.eval()
                 pred_tags, tag_logits = self.predict(tinst.inputs, threshold)
-                for inst, bmatch in batch_variable_inst(onebatch, pred_tags, tag_logits, processor_HDFS.id2tag):
+                for inst, bmatch in batch_variable_inst(onebatch, pred_tags, tag_logits, processor_BGL.id2tag):
                     tag_total += 1
                     if bmatch:
                         tag_correct += 1
@@ -108,7 +151,6 @@ class MetaLog:
                 recall = 100 * TP / (TP + FN)
                 f = 2 * precision * recall / (precision + recall)
                 fpr = 100 * FP /  (FP + TN)
-                end = time.time()
                 self.logger.info('Precision = %d / %d = %.4f, Recall = %d / %d = %.4f F1 score = %.4f, FPR = %.4f'
                                  % (TP, (TP + FP), precision, TP, (TP + FN), recall, f, fpr))
             else:
@@ -129,11 +171,10 @@ if __name__ == '__main__':
     argparser.add_argument('--reduce_dimension', type=int, default=50,
                            help="Reduce dimentsion for fastICA, to accelerate the HDBSCAN probabilistic label estimation.")
     argparser.add_argument('--threshold', type=float, default=0.5,
-                           help="Anomaly threshold for MetaLog.")
+                           help="Anomaly threshold.")
     argparser.add_argument('--beta', type=float, default=1.0,
                            help="weight for meta testing")
-    argparser.add_argument('--beta_loss', type=float, default=1.0,
-                           help="loss weight for meta testing")
+
     args, extra_args = argparser.parse_known_args()
 
     parser = args.parser
@@ -143,7 +184,6 @@ if __name__ == '__main__':
     reduce_dimension = args.reduce_dimension
     threshold = args.threshold
     beta = args.beta
-    beta_loss = args.beta_loss
 
     # process HDFS
     dataset = 'HDFS'
@@ -162,7 +202,7 @@ if __name__ == '__main__':
     # Training, Validating and Testing instances.
     template_encoder_HDFS = Template_TF_IDF_without_clean() if dataset == 'NC' else Simple_template_TF_IDF()
     processor_HDFS = Preprocessor()
-    train_HDFS, dev_HDFS, test_HDFS = processor_HDFS.process(dataset=dataset, parsing=parser, cut_func=cut_by_172,
+    train_HDFS, dev_HDFS, test_HDFS = processor_HDFS.process(dataset=dataset, parsing=parser, cut_func=cut_by_253_filter,
                                          template_encoding=template_encoder_HDFS.present)
 
     # Log sequence representation.
@@ -170,9 +210,6 @@ if __name__ == '__main__':
     train_reprs_HDFS = sequential_encoder_HDFS.present(train_HDFS)
     for index, inst in enumerate(train_HDFS):
         inst.repr = train_reprs_HDFS[index]
-    test_reprs_HDFS = sequential_encoder_HDFS.present(test_HDFS)
-    for index, inst in enumerate(test_HDFS):
-        inst.repr = test_reprs_HDFS[index]
 
     # Dimension reduction if specified.
     transformer_HDFS = None
@@ -279,59 +316,55 @@ if __name__ == '__main__':
     if mode == 'train':
         # Train
         optimizer = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=2e-3)
-        optimizer_meta = Optimizer(filter(lambda p: p.requires_grad, metalog.model.parameters()), lr=beta * 2e-3)
         global_step = 0
         bestF = 0
-
         for epoch in range(epochs):
             metalog.model.train()
+            metalog.bk_model.train()
             start = time.strftime("%H:%M:%S")
             metalog.logger.info("Starting epoch: %d | phase: train | start time: %s | learning rate: %s" %
-                               (epoch + 1, start, optimizer.lr))
+                               (epoch, start, optimizer.lr))
 
             batch_num = int(np.ceil(len(labeled_train_BGL) / float(batch_size)))
             batch_iter = 0
-            # meta train
-            for onebatch in data_iter(labeled_train_BGL, batch_size, True):
-                metalog.model.train()
-                tinst = generate_tinsts_binary_label(onebatch, vocab_BGL)
-                tinst.to_cuda(device)
-                loss = metalog.forward(tinst.inputs, tinst.targets)
-                loss_value = loss.data.cpu().numpy()
-                loss.backward()
-                if batch_iter % 100 == 0:
-                    metalog.logger.info("meta train, Step:%d, Iter:%d, batch:%d, loss:%.2f" \
-                                       % (global_step, epoch, batch_iter, loss_value))
-                batch_iter += 1
-                if batch_iter % 1 == 0 or batch_iter == batch_num:
-                    nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, metalog.model.parameters()),
-                        max_norm=1)
-                    optimizer.step()
-                    metalog.model.zero_grad()
-                    global_step += 1
+            batch_num_test = int(np.ceil(len(labeled_train_HDFS) / float(batch_size)))
+            batch_iter_test = 0
+            total_bn = max(batch_num, batch_num_test)
+            meta_train_loader = data_iter(labeled_train_BGL, batch_size, True)
+            meta_test_loader = data_iter(labeled_train_HDFS, batch_size, True)
 
-            # meta test
-            batch_num = int(np.ceil(len(labeled_train_HDFS) / float(batch_size)))
-            batch_iter = 0
-            for onebatch in data_iter(labeled_train_HDFS, batch_size, True):
-                metalog.model.train()
-                tinst = generate_tinsts_binary_label(onebatch, vocab_HDFS)
-                tinst.to_cuda(device)
-                loss = beta_loss * metalog.forward(tinst.inputs, tinst.targets)
+            for i in range(total_bn):
+                optimizer.zero_grad()
+                # meta train
+                meta_train_batch = meta_train_loader.__next__()
+                meta_test_batch = meta_test_loader.__next__()
+                tinst_tr = generate_tinsts_binary_label(meta_train_batch, vocab_HDFS)
+                tinst_tr.to_cuda(device)
+                loss = metalog.forward(tinst_tr.inputs, tinst_tr.targets)
                 loss_value = loss.data.cpu().numpy()
-                loss.backward()
-                if batch_iter % 100 == 0:
-                    metalog.logger.info("meta test, Step:%d, Iter:%d, batch:%d, loss:%.2f" \
-                                       % (global_step, epoch, batch_iter, loss_value))
+                loss.backward(retain_graph=True)
                 batch_iter += 1
-                if batch_iter % 1 == 0 or batch_iter == batch_num:
-                    nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, metalog.model.parameters()),
-                        max_norm=1)
-                    optimizer_meta.step()
-                    metalog.model.zero_grad()
-                    global_step += 1
+                metalog.bk_model = get_updated_network(metalog.model, metalog.bk_model, 2e-3).train().cuda()
+                # meta test
+                tinst_test = generate_tinsts_binary_label(meta_test_batch, vocab_BGL)
+                tinst_test.to_cuda(device)
+                loss_te = beta * metalog.bk_forward(tinst_test.inputs, tinst_test.targets)
+                loss_value_te = loss_te.data.cpu().numpy() / beta
+                loss_te.backward()
+                batch_iter_test += 1
+                # aggregate
+                optimizer.step()
+                global_step += 1
+                if global_step % 500 == 0:
+                    metalog.logger.info("Step:%d, Epoch:%d, meta train loss:%.2f, meta test loss:%.2f" \
+                                       % (global_step, epoch, loss_value, loss_value_te))
+                if batch_iter == batch_num:
+                    meta_train_loader = data_iter(labeled_train_BGL, batch_size, True)
+                    batch_iter = 0
+                if batch_iter_test == batch_num_test:
+                    meta_test_loader = data_iter(labeled_train_HDFS, batch_size, True)
+                    batch_iter_test = 0
+               
             if test_HDFS:
                 metalog.logger.info('Testing on test set.')
                 _, _, f = metalog.evaluate(test_HDFS)
@@ -339,7 +372,6 @@ if __name__ == '__main__':
                     metalog.logger.info("Exceed best f: history = %.2f, current = %.2f" % (bestF, f))
                     torch.save(metalog.model.state_dict(), best_model_file)
                     bestF = f
-                
             metalog.logger.info('Training epoch %d finished.' % epoch)
             torch.save(metalog.model.state_dict(), last_model_file)
 
